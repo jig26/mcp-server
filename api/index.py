@@ -21,11 +21,23 @@ Vercel invoke functions — there's no guarantee two calls land on the same
 process.
 json_response=True: respond with a single application/json body instead of
 opening an SSE stream, since solve_challenge only ever returns one message.
+
+IMPORTANT — transport_security: the SDK auto-enables DNS-rebinding
+host-header protection whenever `host` is left at its default
+"127.0.0.1", allowlisting only localhost/127.0.0.1/::1 Host headers. That
+protection exists to stop a malicious webpage from making a browser send
+requests to a local dev server under a trusted-looking hostname; it
+doesn't apply to a public HTTPS API meant to be called by arbitrary MCP
+clients, and left on it makes the SDK itself reject every real request
+with 421 "Invalid Host header" once deployed (the real Host header, e.g.
+your-project.vercel.app, isn't in the localhost allowlist). It's
+explicitly disabled below.
 """
 
 import hashlib
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 REGISTERED_EMAIL = "25f1001599@ds.study.iitm.ac.in".strip().lower()
 
@@ -34,6 +46,7 @@ mcp = FastMCP(
     instructions="Exposes solve_challenge, which answers a per-call exam challenge read from HTTP headers.",
     stateless_http=True,
     json_response=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
