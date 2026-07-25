@@ -1,0 +1,101 @@
+import hashlib
+import json
+import os
+import secrets
+import time
+
+import httpx
+
+BASE_URL = os.environ.get("MCP_TEST_URL", "http://127.0.0.1:8812/mcp")
+EMAIL = "25f1001599@ds.study.iitm.ac.in"
+
+JSONRPC_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+
+
+def rpc(client, body, extra_headers=None, session_id=None):
+    headers = dict(JSONRPC_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    resp = client.post(BASE_URL, json=body, headers=headers)
+    return resp
+
+
+def main():
+    with httpx.Client(timeout=10.0) as client:
+        # 1. initialize
+        init_resp = rpc(client, {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "grader-sim", "version": "0.1"},
+            },
+        })
+        print("initialize status:", init_resp.status_code)
+        session_id = init_resp.headers.get("mcp-session-id")
+        print("session id header:", session_id)
+        init_json = init_resp.json()
+        print("negotiated version:", init_json.get("result", {}).get("protocolVersion"))
+        assert init_resp.status_code == 200, init_resp.text
+
+        # 2. notifications/initialized
+        notif_resp = rpc(client, {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }, session_id=session_id)
+        print("notifications/initialized status:", notif_resp.status_code)
+        assert notif_resp.status_code in (200, 202), notif_resp.text
+
+        # 3. tools/list
+        list_resp = rpc(client, {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        }, session_id=session_id)
+        print("tools/list status:", list_resp.status_code)
+        list_json = list_resp.json()
+        tools = list_json["result"]["tools"]
+        names = [t["name"] for t in tools]
+        print("tools:", names)
+        assert "solve_challenge" in names, "solve_challenge tool missing"
+        target = [t for t in tools if t["name"] == "solve_challenge"][0]
+        print("inputSchema:", target["inputSchema"])
+        assert target["inputSchema"].get("required", []) == [], "tool has required properties!"
+
+        # 4. tools/call x5 with fresh per-call headers
+        all_ok = True
+        for i in range(5):
+            challenge = secrets.token_hex(16)  # 32 lowercase hex chars
+            ts = str(int(time.time() * 1000))
+            call_resp = rpc(client, {
+                "jsonrpc": "2.0",
+                "id": 100 + i,
+                "method": "tools/call",
+                "params": {"name": "solve_challenge", "arguments": {}},
+            }, extra_headers={
+                "X-Exam-Challenge": challenge,
+                "X-Exam-Timestamp": ts,
+                "X-Exam-Signature": "deadbeef",  # unscored, server doesn't verify
+            }, session_id=session_id)
+
+            call_json = call_resp.json()
+            text = call_json["result"]["content"][0]["text"]
+            expected = hashlib.sha256(f"{challenge}:{EMAIL}".encode()).hexdigest()[:16]
+            ok = text == expected
+            all_ok &= ok
+            print(f"call {i}: status={call_resp.status_code} challenge={challenge} got={text} expected={expected} {'OK' if ok else 'FAIL'}")
+
+        print()
+        print("ALL TOOL CALLS PASSED" if all_ok else "SOME TOOL CALLS FAILED")
+
+
+if __name__ == "__main__":
+    main()
