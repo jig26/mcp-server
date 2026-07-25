@@ -1,0 +1,149 @@
+# exam-solver MCP server
+
+A minimal MCP server (Streamable HTTP transport) exposing exactly one tool,
+`solve_challenge`, which reads the exam challenge from the live HTTP
+request's headers on every call — not from the JSON-RPC body.
+
+## Endpoint
+
+Once deployed, the MCP endpoint is:
+
+```
+https://<your-project>.vercel.app/mcp
+```
+
+(`/mcp` — that's the official MCP SDK's default streamable-HTTP path.
+Vercel serves this whole app as one Function and lets its internal
+Starlette router match sub-paths, so `/mcp` resolves correctly with no
+extra routing config.) **Give the grader the full URL including `/mcp`.**
+
+## Why the official `mcp` Python SDK instead of hand-rolled JSON-RPC
+
+Streamable HTTP has real protocol details (Accept-header negotiation,
+optional SSE vs. plain-JSON responses, protocol version negotiation,
+optional session IDs) that a real MCP client will exercise. Hand-rolling
+it risks subtle incompatibilities with whatever client the grader uses.
+The official SDK (`mcp`, the same one used to build MCP servers/clients
+generally) is built and tested against the real protocol, so this uses
+it directly:
+
+```python
+mcp = FastMCP("exam-solver", stateless_http=True, json_response=True)
+```
+
+- `stateless_http=True` — every request is handled independently, no
+  server-side session store. This also happens to be required for a
+  serverless deploy target like Vercel, since nothing guarantees two
+  calls land on the same warm process.
+- `json_response=True` — respond with a single `application/json` body
+  instead of opening an SSE stream, since `solve_challenge` only ever
+  returns one message.
+
+## How the per-call header read works
+
+The tool function takes a `Context` parameter:
+
+```python
+@mcp.tool()
+def solve_challenge(ctx: Context) -> str:
+    request = ctx.request_context.request  # the raw Starlette Request for *this* call
+    challenge = request.headers.get("x-exam-challenge") or ""
+    return hashlib.sha256(f"{challenge}:{REGISTERED_EMAIL}".encode()).hexdigest()[:16]
+```
+
+The SDK threads the actual per-request `Request` object through
+`ctx.request_context.request` for each individual JSON-RPC message — so
+even though `tools/list` and all five `tools/call`s belong to one logical
+MCP session, each is its own HTTP POST, and this handler reads that
+specific request's headers, not a cached copy from `initialize`.
+
+`Context` parameters are automatically excluded from the generated JSON
+schema, so `solve_challenge`'s `inputSchema` comes out as
+`{"properties": {}, "type": "object"}` — no required properties, as
+specified. Verified locally (see below).
+
+`X-Exam-Signature` isn't checked: verification is explicitly optional/
+unscored, and there's no way to check it anyway without the exam-only
+HMAC secret, which isn't given to the server.
+
+## About that 421 error
+
+If you deployed an earlier version of this file, you may have hit
+`HTTP 421`. That turned out to have nothing to do with Vercel routing
+or `vercel.json` — it's the MCP SDK's own DNS-rebinding protection.
+`FastMCP` auto-enables a Host-header allowlist whenever `host` is left
+at its default `"127.0.0.1"`, permitting only `localhost` / `127.0.0.1`
+/ `::1`. That's meant to stop a malicious webpage from tricking a
+browser into hitting a local dev server under a trusted-looking name —
+it doesn't apply to a public HTTPS API, and left on, the SDK rejects
+every real request (whose Host header is your actual `*.vercel.app`
+domain) with `421 Invalid Host header`, before your tool code ever
+runs. Confirmed locally by spoofing the `Host` header against a plain
+build (`421`) vs. this one (`200`).
+
+Fixed by explicitly passing:
+
+```python
+transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+```
+
+to `FastMCP(...)`. This file already has that fix.
+
+## Local testing
+
+```bash
+pip install -r requirements.txt httpx --break-system-packages
+uvicorn api.index:app --port 8812 &
+MCP_TEST_URL=http://127.0.0.1:8812/mcp python3 test_mcp_client.py
+```
+
+`test_mcp_client.py` is a raw HTTP client (not the high-level MCP client
+SDK) that mimics the grader exactly: `initialize` →
+`notifications/initialized` → `tools/list` → five `tools/call`s, each
+with a **freshly generated** 32-hex-char `X-Exam-Challenge` header, and
+checks the returned text against an independently computed
+`sha256(challenge:email)[:16]` for each one. All 5 passed in testing,
+plus the schema check.
+
+## Deploy to Vercel
+
+Vercel's current Python runtime auto-detects this with **zero configuration** —
+no `vercel.json` needed. It looks for a top-level `app` (ASGI/WSGI) in a
+recognized entrypoint file (`app.py`, `index.py`, `server.py`, `main.py`,
+`wsgi.py`, or `asgi.py`, at the project root or under `src/`, `app/`, or
+`api/`) and serves your whole app as a single Vercel Function — every
+request goes to that app and its own router matches the path. `api/index.py`
+already satisfies this, so this folder deploys as-is.
+
+(If you're deploying this project after an earlier attempt that included a
+`vercel.json` with a `builds`/`routes` block — that's the old, now-legacy
+config format and can cause routing errors like a 421. Just delete it;
+none is required here.)
+
+**Via CLI:**
+
+```bash
+npm i -g vercel
+cd exam-solver-mcp
+vercel --prod
+```
+
+**Via GitHub (your usual flow):** push this folder to a repo, then
+Vercel dashboard → New Project → Import → Deploy. No env vars needed.
+
+Once deployed, sanity-check with curl (note the two Accept types are
+both required by the streamable-HTTP spec):
+
+```bash
+curl -i -X POST https://<your-project>.vercel.app/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+You should get back a 200 with a JSON-RPC result containing
+`serverInfo` / `capabilities`.
+
+**Keep it deployed and warm through the grading window** — the grading
+note says a passing run earlier doesn't count if the server is down when
+the live check actually runs.
